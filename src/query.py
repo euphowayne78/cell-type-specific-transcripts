@@ -176,6 +176,120 @@ def compare_across_cell_types(
     return comparison.sort_values("mean_cpm", ascending=False).reset_index(drop=True)
 
 
+def query_gene(
+    gene: str,
+    mean_df: pd.DataFrame,
+    det_df: pd.DataFrame,
+    pseudocount: float = 0.1,
+    tau_threshold: float = 0.85,
+    fc_threshold: float = 10.0,
+    on_target_det_min: float = 0.25,
+    off_target_det_max: float = 0.05,
+    on_target_expr_min: float = 1.0,
+) -> pd.DataFrame:
+    """Return per-cell-type specificity metrics for a single gene.
+
+    Computes all metrics from the raw expression matrices so the result is
+    not limited to the single best cell type stored in the results table.
+
+    Parameters
+    ----------
+    gene : str
+        Gene symbol to query.
+    mean_df : pd.DataFrame
+        Mean CPM matrix (genes × cell types).
+    det_df : pd.DataFrame
+        Detection-rate matrix (genes × cell types).
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per cell type, sorted by mean_cpm descending.
+        Columns: ``cell_type``, ``mean_cpm``, ``log2_cpm``,
+        ``detection_rate``, ``fold_change_vs_next``, ``second_highest_cpm``,
+        ``tau``, ``is_top_cell_type``,
+        ``expr_pass``, ``det_pass``, ``off_target_det_pass``, ``fc_pass``,
+        ``all_pass``.
+    """
+    import numpy as np
+
+    if gene not in mean_df.index:
+        raise ValueError(
+            f"Gene '{gene}' not found in the expression matrix. "
+            f"Check spelling and case (gene symbols are case-sensitive)."
+        )
+
+    expr = mean_df.loc[gene]          # Series: cell_type → mean CPM
+    det  = det_df.loc[gene]           # Series: cell_type → detection rate
+    n    = len(expr)
+
+    # Tau (gene-level, single value)
+    log_expr = np.log2(1 + expr)
+    max_log  = log_expr.max()
+    if max_log == 0:
+        tau_val = 0.0
+    else:
+        x_hat   = log_expr / max_log
+        tau_val = float((1 - x_hat).sum() / (n - 1))
+
+    # Fold-change vs next-highest for every cell type
+    fc_list      = []
+    second_list  = []
+    for ct in expr.index:
+        others_max = expr.drop(index=ct).max()
+        fc_list.append((expr[ct] + pseudocount) / (others_max + pseudocount))
+        second_list.append(others_max)
+
+    # Off-target detection: max detection rate in all OTHER cell types
+    off_det_list = []
+    for ct in det.index:
+        off_det_list.append(det.drop(index=ct).max())
+
+    top_ct = expr.idxmax()
+
+    df = pd.DataFrame({
+        "cell_type":           expr.index,
+        "mean_cpm":            expr.values,
+        "log2_cpm":            np.log2(1 + expr.values),
+        "detection_rate":      det.values,
+        "fold_change_vs_next": fc_list,
+        "second_highest_cpm":  second_list,
+        "max_off_target_det":  off_det_list,
+        "tau":                 tau_val,
+        "is_top_cell_type":    [ct == top_ct for ct in expr.index],
+    })
+
+    df["expr_pass"]         = df["mean_cpm"] >= on_target_expr_min
+    df["det_pass"]          = df["detection_rate"] >= on_target_det_min
+    df["off_target_det_pass"] = df["max_off_target_det"] <= off_target_det_max
+    df["fc_pass"]           = df["fold_change_vs_next"] >= fc_threshold
+    df["tau_pass"]          = tau_val >= tau_threshold
+    df["all_pass"]          = (
+        df["tau_pass"]
+        & df["expr_pass"]
+        & df["det_pass"]
+        & df["off_target_det_pass"]
+        & df["fc_pass"]
+    )
+
+    df = df.sort_values("mean_cpm", ascending=False).reset_index(drop=True)
+
+    # Round for readability
+    for col in ["mean_cpm", "log2_cpm", "second_highest_cpm"]:
+        df[col] = df[col].round(2)
+    df["detection_rate"]      = df["detection_rate"].round(4)
+    df["fold_change_vs_next"] = df["fold_change_vs_next"].round(2)
+    df["max_off_target_det"]  = df["max_off_target_det"].round(4)
+    df["tau"]                 = round(tau_val, 4)
+
+    logger.info(
+        "Gene query '%s': tau=%.3f, top cell type='%s' (%.1f CPM), all_pass=%s",
+        gene, tau_val, top_ct, float(expr[top_ct]),
+        df.loc[df["is_top_cell_type"], "all_pass"].any(),
+    )
+    return df
+
+
 def generate_report(
     results: pd.DataFrame,
     cell_type: str,
