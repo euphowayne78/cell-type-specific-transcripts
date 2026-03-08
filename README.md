@@ -1,5 +1,7 @@
 # Cell-Type Specific Transcript Identification Pipeline
 
+[![GitHub](https://img.shields.io/badge/GitHub-euphowayne78%2Fcell--type--specific--transcripts-blue?logo=github)](https://github.com/euphowayne78/cell-type-specific-transcripts)
+
 A computational pipeline for identifying **cell-type specific cytosolic transcripts** in human tissues, designed to support ADAR-based therapeutic mRNA technology.
 
 ## Background
@@ -36,6 +38,11 @@ Specific_Transcript/
 │   ├── processed/                     # Normalized pseudobulk matrices
 │   └── references/                    # Housekeeping gene lists, lncATLAS data, etc.
 ├── results/                           # Output tables, heatmaps, ranked transcript lists
+│   ├── specificity_scores.csv         # Full results (all genes passing Tau threshold)
+│   ├── specific_transcripts_all_pass.csv  # High-confidence hits (all thresholds passed)
+│   ├── top5_per_cell_type.csv         # Top 5 per cell type, combined
+│   ├── heatmaps/                      # Expression heatmaps
+│   └── cell_type_reports/             # Per-cell-type top-10 CSVs
 ├── tests/                             # Unit tests for src/ modules
 ├── requirements.txt
 └── README.md
@@ -357,13 +364,31 @@ With 100 cell types, the AUROC > 0.9 threshold means the target must be ranked i
 
 ### Combined Scoring
 
-A transcript is reported as a **high-confidence hit** (`all_pass = True`) only if it passes **all five** supporting metrics in addition to the Tau threshold. The full results table ranks candidates by:
+A transcript is reported as a **high-confidence hit** (`all_pass = True`) only if it passes **all five** supporting metrics in addition to the Tau threshold.
 
-1. `all_pass` (True first)
-2. Tau (descending)
-3. Fold-change (descending)
+#### Composite Specificity Score
 
-This ranking surfaces the most specific, highest-expressing, best-separated candidates at the top of each cell-type report.
+In addition to the binary `all_pass` flag, a **weighted composite score** is computed for every candidate to enable continuous ranking within and across cell types. Each metric is normalised to [0, 1] and combined as:
+
+```
+composite_score = 0.35 × τ_norm
+                + 0.25 × FC_norm        (log10-scaled, then divided by dataset max)
+                + 0.20 × detection_rate
+                + 0.10 × log2_cpm_norm  (divided by dataset max)
+                + 0.10 × (1 − max_off_target_det)
+```
+
+| Component | Weight | Normalisation |
+|---|---|---|
+| Tau | 35% | Already [0, 1] |
+| Fold-change | 25% | log10(FC + 1), divided by dataset max |
+| On-target detection rate | 20% | Already [0, 1] |
+| On-target log2 CPM | 10% | Divided by dataset max |
+| Inverted off-target detection | 10% | 1 − max_off_target_det |
+
+The composite score ranges from 0 to 1. Candidates are sorted first by `all_pass` (True before False), then by `composite_score` descending. This means the most specific, best-supported genes appear at the top of every cell-type report regardless of which individual metric is highest.
+
+The top genes per cell type are accessible via `query_cell_type()` in `src/specificity.py`, which automatically sorts by `composite_score` when available.
 
 ---
 
@@ -377,9 +402,13 @@ After running all notebooks, the following files are generated:
 | `data/processed/pseudobulk_detection_rate.parquet` | Fraction of cells expressing each gene |
 | `data/processed/gene_id_map.parquet` | Ensembl ID ↔ gene symbol mapping |
 | `data/processed/cell_type_summary.parquet` | Cell type counts and dataset representation |
-| `results/specificity_scores.csv` | Full ranked table of all gene–cell type pairs |
+| `results/specificity_scores.csv` | Full ranked table of all gene–cell type pairs passing Tau threshold |
+| `results/specific_transcripts_all_pass.csv` | Subset passing **all** thresholds (high-confidence hits only) |
+| `results/top5_per_cell_type.csv` | Top 5 genes per cell type combined into a single table |
+| `results/cell_type_reports/<cell_type>_top10.csv` | Top 10 genes for each individual cell type |
 | `results/heatmaps/` | Expression heatmaps per cell type |
-| `results/cell_type_reports/` | Per-cell-type ranked transcript lists |
+
+All `results/cell_type_reports/` CSVs include the full set of scoring columns: `gene`, `cell_type`, `tau`, `mean_cpm`, `log2_cpm`, `detection_rate`, `fold_change`, `second_highest_cpm`, `max_off_target_det`, `on_target_expr_pass`, `on_target_det_pass`, `off_target_det_pass`, `fc_pass`, `all_pass`, `composite_score`.
 
 ---
 
@@ -435,6 +464,16 @@ The pipeline validates itself against known marker genes:
 | KRT14 | Keratinocyte |
 | CD79A | B cell |
 | PECAM1 | Endothelial cell |
+
+---
+
+## Data Quality Notes
+
+### Duplicate gene names
+CELLxGENE Census can return multiple Ensembl IDs mapped to the same gene symbol (e.g. for read-through transcripts, pseudogene copies, or version mismatches). When duplicates are detected in the pseudobulk matrix, `score_specificity()` automatically resolves them by **keeping the maximum expression row per gene name** (applied to both the mean CPM and detection-rate matrices simultaneously). A warning is logged with the count of duplicates removed. This is conservative — it retains the highest-expressed copy, which is the most relevant for ADAR sensor design.
+
+### Parquet serialization of gene ID map
+The `save_pseudobulk()` function stores the Ensembl ID ↔ gene symbol mapping as a separate `gene_id_map.parquet` file rather than embedding it in the DataFrame's `attrs` metadata. This is necessary because the parquet format cannot serialize pandas Series objects stored in `attrs`.
 
 ---
 
